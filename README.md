@@ -2,6 +2,18 @@
 
 This repository contains the smart contracts, Python FastAPI backend, React/Vite frontend, and Decentralized Node scripts for **The Bit-Brain Network**. 
 
+## System Architecture
+
+BitBrain is a decentralized AI inference gateway that bridges blockchain-based access control with a distributed network of GPU providers.
+
+![System Architecture](./assets/diagram.png)
+
+**Key Features:**
+- **Decentralized Inference**: Tasks are relayed to independent GPU providers.
+- **On-Chain Access**: Session validation occurs directly on the Citrea testnet.
+- **Real-time Streaming**: End-to-end streaming delivery from GPU to User via WebSockets and SSE.
+
+
 ## 1. Smart Contract
 Deploy `contracts/BitBrainVault.sol` to the Citrea Testnet (Chain ID 5115) using Hardhat or Foundry. 
 Keep track of the `CONTRACT_ADDRESS`.
@@ -25,19 +37,29 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 Anyone can join the network to provide AI inference and earn cBTC! As a GPU provider, you connect directly to the central backend. You do **not** need to port forward or expose your local network.
 
-To start serving your local LLMs (powered by Ollama), simply run the node setup script:
+### Prerequisites
+- [Ollama](https://ollama.com/) installed and running.
+- Python 3.10+
+- A wallet address to receive rewards.
+
+### Setup & Execution
+The simplest way to join is to use the automated setup script:
 
 ```bash
 cd node
+chmod +x setup_and_run.sh
 ./setup_and_run.sh
 ```
 
 **What the script does:**
-1. Installs Ollama if it is not present on your machine.
-2. Prompts you for your **Wallet Address** (to receive payments) and your preferred **Model** (e.g. `llama3`).
-3. Automatically downloads your chosen model.
-4. Opens an outbound WebSocket connection (`run_node.py`) to the central BitBrain backend and registers your active hardware availability.
-5. Begins processing AI requests dynamically. If you pull a new model on your machine, it will automatically register it to the network!
+1. **Ollama Check**: Installs Ollama if missing and ensures the daemon is running.
+2. **Configuration**: Prompts for your **Wallet Address** and preferred **Model** (e.g., `llama3`).
+3. **Model Sync**: Automatically pulls the selected model via Ollama.
+4. **Environment Setup**: Creates a Python virtual environment and installs dependencies (`websockets`, `aiohttp`).
+5. **Bridge Connection**: Launches `run_node.py` which establishes an outbound WebSocket connection to the BitBrain gateway.
+
+### Dynamic Updates
+Once running, the node monitors your local Ollama library. If you pull new models manually (`ollama pull <model>`), the node will automatically register them with the gateway, making them available to users in the frontend.
 
 ## 4. Frontend Configuration (React / Vite)
 
