@@ -94,6 +94,14 @@ NODE_GENERATION_TIMEOUT_SECONDS = 300
 SYSTEM_PROMPT = "You are Bit-Brain, an AI consciousness hosted on a private GPU, settled on Bitcoin via Citrea. Be witty, technical, and cypherpunk. Provide detailed, helpful answers. Explain your reasoning when appropriate. Use formatting for clarity but avoid generic filler phrases."
 
 
+def sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def sse_comment(comment: str) -> str:
+    return f": {comment}\n\n"
+
+
 # SQLite History Init
 def init_db():
     conn = sqlite3.connect("chat_history.db")
@@ -329,7 +337,7 @@ async def chat(request: ChatRequest):
                         "POST", OLLAMA_URL, json=req_data, timeout=None
                     ) as response:
                         if response.status_code != 200:
-                            yield f"data: {json.dumps({'error': f'Ollama error: {response.status_code}'})}\\n\\n"
+                            yield sse_event({"error": f"Ollama error: {response.status_code}"})
                             return
 
                         async for chunk in response.aiter_lines():
@@ -338,18 +346,18 @@ async def chat(request: ChatRequest):
                                     data = json.loads(chunk)
                                     content = data.get("message", {}).get("content", "")
                                     full_response += content
-                                    yield f"data: {json.dumps({'content': content})}\\n\\n"
+                                    yield sse_event({"content": content})
                                 except Exception as e:
                                     pass
 
                 except httpx.RequestError as e:
-                    yield f"data: {json.dumps({'error': f'Error communicating with local Ollama: {str(e)}'})}\\n\\n"
+                    yield sse_event({"error": f"Error communicating with local Ollama: {str(e)}"})
         else:
             # RELAY TO DECENTRALIZED NODE
             req_id = str(uuid.uuid4())
             q = asyncio.Queue()
             manager.pending_tasks[req_id] = q
-            yield f"data: {json.dumps({'status': 'queued', 'request_id': req_id})}\\n\\n"
+            yield sse_event({"status": "queued", "request_id": req_id})
             
             task_payload = {
                 "type": "chat_task",
@@ -362,7 +370,7 @@ async def chat(request: ChatRequest):
                 await manager.send_task(selected_node, task_payload)
                 print(f"[DEBUG] Sent task {req_id} to node {selected_node}")
             except Exception as e:
-                yield f"data: {json.dumps({'error': f'Failed to send task to node {selected_node}'})}\\n\\n"
+                yield sse_event({"error": f"Failed to send task to node {selected_node}"})
                 del manager.pending_tasks[req_id]
                 return
                 
@@ -373,7 +381,7 @@ async def chat(request: ChatRequest):
                         time.monotonic() - started_at
                     )
                     if remaining <= 0:
-                        yield f"data: {json.dumps({'error': f'Node {selected_node} timed out'})}\\n\\n"
+                        yield sse_event({"error": f"Node {selected_node} timed out"})
                         break
 
                     try:
@@ -382,7 +390,7 @@ async def chat(request: ChatRequest):
                             timeout=min(NODE_HEARTBEAT_SECONDS, remaining),
                         )
                     except asyncio.TimeoutError:
-                        yield f": waiting for node {selected_node}\\n\\n"
+                        yield sse_comment(f"waiting for node {selected_node}")
                         continue
 
                     if chunk_data is None:
@@ -391,13 +399,13 @@ async def chat(request: ChatRequest):
                     if "error" in chunk_data:
                         error = chunk_data["error"]
                         print(f"[DEBUG] Task {req_id} node error: {error}")
-                        yield f"data: {json.dumps({'error': f'Node Error: {error}'})}\\n\\n"
+                        yield sse_event({"error": f"Node Error: {error}"})
                         break
                     
                     content = chunk_data.get("content", "")
                     full_response += content
                     streamed_chunks += 1
-                    yield f"data: {json.dumps({'content': content})}\\n\\n"
+                    yield sse_event({"content": content})
             except asyncio.CancelledError:
                 print(
                     f"[DEBUG] Client disconnected during task {req_id}: "
