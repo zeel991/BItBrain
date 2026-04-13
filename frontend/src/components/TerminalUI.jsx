@@ -170,6 +170,10 @@ export default function TerminalUI() {
       .map((line) => line.slice(5).trimStart())
       .join("\n");
 
+    if (!normalized || normalized.startsWith(":")) {
+      return;
+    }
+
     if (!dataStr) {
       console.warn("Ignoring non-SSE stream event", normalized);
       return;

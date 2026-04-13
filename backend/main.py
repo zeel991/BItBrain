@@ -89,6 +89,8 @@ else:
 MAX_CONTEXT_MESSAGES = 10
 # Full transcript for GET /history (session restore UI), not LLM context
 MAX_SESSION_RESTORE_MESSAGES = 500
+NODE_HEARTBEAT_SECONDS = 10
+NODE_GENERATION_TIMEOUT_SECONDS = 300
 SYSTEM_PROMPT = "You are Bit-Brain, an AI consciousness hosted on a private GPU, settled on Bitcoin via Citrea. Be witty, technical, and cypherpunk. Provide detailed, helpful answers. Explain your reasoning when appropriate. Use formatting for clarity but avoid generic filler phrases."
 
 
@@ -365,9 +367,24 @@ async def chat(request: ChatRequest):
                 return
                 
             try:
+                started_at = time.monotonic()
                 while True:
-                    # Implement local timeout to not hang forever if node dies
-                    chunk_data = await asyncio.wait_for(q.get(), timeout=30.0)
+                    remaining = NODE_GENERATION_TIMEOUT_SECONDS - (
+                        time.monotonic() - started_at
+                    )
+                    if remaining <= 0:
+                        yield f"data: {json.dumps({'error': f'Node {selected_node} timed out'})}\\n\\n"
+                        break
+
+                    try:
+                        chunk_data = await asyncio.wait_for(
+                            q.get(),
+                            timeout=min(NODE_HEARTBEAT_SECONDS, remaining),
+                        )
+                    except asyncio.TimeoutError:
+                        yield f": waiting for node {selected_node}\\n\\n"
+                        continue
+
                     if chunk_data is None:
                         print(f"[DEBUG] Task {req_id} completed")
                         break # Done
@@ -381,8 +398,6 @@ async def chat(request: ChatRequest):
                     full_response += content
                     streamed_chunks += 1
                     yield f"data: {json.dumps({'content': content})}\\n\\n"
-            except asyncio.TimeoutError:
-                yield f"data: {json.dumps({'error': f'Node {selected_node} timed out'})}\\n\\n"
             except asyncio.CancelledError:
                 print(
                     f"[DEBUG] Client disconnected during task {req_id}: "
