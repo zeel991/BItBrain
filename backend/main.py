@@ -39,15 +39,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Force use of a stable public RPC regardless of terminal environment variables
-CITREA_RPC_URL = "https://rpc.testnet.citrea.xyz"
+DEFAULT_CITREA_RPC_URL = "https://rpc.testnet.citrea.xyz"
+CITREA_RPC_URLS = [
+    url.strip()
+    for url in os.getenv(
+        "CITREA_RPC_URLS",
+        os.getenv("CITREA_RPC_URL", DEFAULT_CITREA_RPC_URL),
+    ).split(",")
+    if url.strip()
+]
+if not CITREA_RPC_URLS:
+    CITREA_RPC_URLS = [DEFAULT_CITREA_RPC_URL]
 CONTRACT_ADDRESS = os.getenv(
     "CONTRACT_ADDRESS", "0xC8014e9D37cc59Fed1988aCbfFE59246A16374AA"
 )
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 
-web3 = Web3(Web3.HTTPProvider(CITREA_RPC_URL))
+web3 = Web3(Web3.HTTPProvider(CITREA_RPC_URLS[0], request_kwargs={"timeout": 12}))
 
 # Simplified ABI for expiryTimestamp
 ABI = [
@@ -60,13 +69,21 @@ ABI = [
     }
 ]
 
-# Set up contract if address is provided
+# Set up contract readers if an address is provided
 if CONTRACT_ADDRESS != "0x0000000000000000000000000000000000000000":
-    contract = web3.eth.contract(
-        address=web3.to_checksum_address(CONTRACT_ADDRESS), abi=ABI
-    )
+    contract_address = web3.to_checksum_address(CONTRACT_ADDRESS)
+    contract_readers = [
+        (
+            url,
+            Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 12})).eth.contract(
+                address=contract_address, abi=ABI
+            ),
+        )
+        for url in CITREA_RPC_URLS
+    ]
 else:
-    contract = None
+    contract_address = None
+    contract_readers = []
 
 # Context Management
 MAX_CONTEXT_MESSAGES = 10
@@ -113,6 +130,26 @@ def add_message(address, role, content):
     )
     conn.commit()
     conn.close()
+
+
+async def read_expiry_timestamp(checksum_addr: str) -> int:
+    last_error = None
+
+    for attempt in range(3):
+        for rpc_url, reader in contract_readers:
+            try:
+                return await asyncio.to_thread(
+                    reader.functions.expiryTimestamp(checksum_addr).call
+                )
+            except Exception as e:
+                last_error = e
+                print(
+                    f"Contract check RPC error on attempt {attempt + 1} "
+                    f"({rpc_url}): {e}"
+                )
+        await asyncio.sleep(0.5 * (attempt + 1))
+
+    raise RuntimeError(f"Citrea RPC unavailable after retries: {last_error}")
 
 
 class ChatRequest(BaseModel):
@@ -225,16 +262,22 @@ async def chat(request: ChatRequest):
         )
 
     # Blockchain validation (with a 60 second grace period)
-    if contract:
+    if contract_readers:
         try:
-            expiry = contract.functions.expiryTimestamp(checksum_addr).call()
+            expiry = await read_expiry_timestamp(checksum_addr)
             if (expiry + 60) < time.time():
                 raise HTTPException(status_code=403, detail="Session expired")
         except Exception as e:
             if isinstance(e, HTTPException):
                 raise e
             print(f"Contract check error: {e}")
-            raise HTTPException(status_code=500, detail=f"Blockchain validation failed: {str(e)}")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Citrea RPC temporarily unavailable while validating access. "
+                    "Your payment may be confirmed; retry chat in a few seconds."
+                ),
+            )
 
     # If no target node specified, we can try to find one or fallback to local
     use_local_fallback = False

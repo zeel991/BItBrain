@@ -17,6 +17,8 @@ services:
         value: llama3
       - key: CONTRACT_ADDRESS
         value: 0xC8014e9D37cc59Fed1988aCbfFE59246A16374AA
+      - key: CITREA_RPC_URLS
+        value: https://rpc.testnet.citrea.xyz,https://rpc.testnet.citreascan.com
       # Required: Cloudflare tunnel to your laptop Ollama, full path /api/chat
       - key: OLLAMA_URL
         sync: false
