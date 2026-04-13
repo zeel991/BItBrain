@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { usePrivy, useWallets } from "@privy-io/react-auth";
 import { HardwareWidget } from "./HardwareWidget";
 import { Send, Terminal, Lock, Unlock } from "lucide-react";
@@ -22,7 +22,6 @@ import ReactMarkdown from "react-markdown";
 const CONTRACT_ADDRESS =
   import.meta.env.VITE_CONTRACT_ADDRESS ||
   "0xC8014e9D37cc59Fed1988aCbfFE59246A16374AA";
-// Read access contract on Citrea Testnet regardless of wallet chain (wallet RPC was returning 0x when chain mismatched).
 const ACCESS_READ_RPC =
   import.meta.env.VITE_ACCESS_READ_RPC ||
   "https://rpc.testnet.citrea.xyz";
@@ -30,12 +29,40 @@ const accessReadClient = createPublicClient({
   chain: citreaTestnet,
   transport: http(ACCESS_READ_RPC),
 });
-// Empty VITE_API_URL → same-origin (FastAPI + static bundle behind one tunnel).
 const _viteApi = import.meta.env.VITE_API_URL;
 const API_BASE =
   _viteApi === undefined || _viteApi === null
     ? "http://localhost:8000"
     : String(_viteApi).replace(/\/$/, "");
+
+// Stable markdown component map — defined once outside component to avoid
+// re-creating object on every render, which forces ReactMarkdown to remount.
+const MD_COMPONENTS = {
+  p: ({ children }) => <p className="mb-2">{children}</p>,
+  ul: ({ children }) => <ul className="list-disc ml-4 mb-2">{children}</ul>,
+  ol: ({ children }) => <ol className="list-decimal ml-4 mb-2">{children}</ol>,
+  li: ({ children }) => <li className="mb-1">{children}</li>,
+  h1: ({ children }) => <h1 className="text-lg font-bold mb-2">{children}</h1>,
+  h2: ({ children }) => <h2 className="text-base font-bold mb-2">{children}</h2>,
+  h3: ({ children }) => <h3 className="text-sm font-bold mb-2">{children}</h3>,
+  code: ({ className, children, ...props }) => {
+    const isInline = !className;
+    return isInline ? (
+      <code className="bg-terminal-green/20 px-1 rounded" {...props}>{children}</code>
+    ) : (
+      <code className="block bg-terminal-green/20 p-2 rounded my-2 overflow-x-auto whitespace-pre" {...props}>{children}</code>
+    );
+  },
+  pre: ({ children }) => (
+    <pre className="bg-terminal-green/10 p-2 rounded overflow-x-auto mb-2">{children}</pre>
+  ),
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-2 border-terminal-green/50 pl-2 italic">{children}</blockquote>
+  ),
+  a: ({ href, children }) => (
+    <a href={href} className="underline hover:text-terminal-green/70" target="_blank" rel="noopener noreferrer">{children}</a>
+  ),
+};
 
 function parseJsonResponse(raw, status) {
   try {
@@ -66,14 +93,39 @@ function formatStreamError(message) {
   return `\n[ERROR: ${message}]`;
 }
 
-// SESSION_PRICE is 0.0001 ether = 100000000000000 wei = 0x5af3107a4000
 const SESSION_PRICE_HEX = "0x5af3107a4000";
+
+// Memoized message row to avoid re-rendering entire list on each stream chunk
+const MessageRow = ({ msg, isLastAssistant, isInference }) => (
+  <div
+    className={
+      msg.role === "user"
+        ? "text-blue-400"
+        : msg.role === "system"
+          ? "text-yellow-500/80 text-xs uppercase"
+          : "text-terminal-green"
+    }
+  >
+    <span className="opacity-50 mr-2">
+      {msg.role === "user" ? ">" : msg.role === "system" ? "!" : "AI:"}
+    </span>
+    {msg.role === "assistant" && msg.content ? (
+      <div className="markdown-content prose prose-invert max-w-none">
+        <ReactMarkdown components={MD_COMPONENTS}>{msg.content}</ReactMarkdown>
+      </div>
+    ) : (
+      <span className="whitespace-pre-wrap leading-relaxed">{msg.content}</span>
+    )}
+    {msg.role === "assistant" && isLastAssistant && isInference && (
+      <span className="cursor-blink"></span>
+    )}
+  </div>
+);
 
 export default function TerminalUI() {
   const { login, authenticated, logout } = usePrivy();
   const { wallets } = useWallets();
 
-  // UI states: 'locked', 'active', 'inference'
   const [sessionState, setSessionState] = useState("locked");
   const [hasCheckedAccess, setHasCheckedAccess] = useState(false);
   const [expiryTime, setExpiryTime] = useState(0);
@@ -88,65 +140,78 @@ export default function TerminalUI() {
   ]);
   const [input, setInput] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
-  
-  // New state for Decentralized Node Selection
+
   const [availableNodes, setAvailableNodes] = useState([]);
   const [selectedNode, setSelectedNode] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
   const [nodeError, setNodeError] = useState("");
-  
+
   const chatContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
 
-  // Fetch available nodes periodically
-  useEffect(() => {
-    const fetchNodes = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/nodes`);
-        const raw = await res.text();
-        const data = parseJsonResponse(raw, res.status);
+  // Keep stable refs for values used inside intervals/effects to avoid
+  // re-subscribing those effects on every state change.
+  const selectedNodeRef = useRef(selectedNode);
+  const selectedModelRef = useRef(selectedModel);
+  const authenticatedRef = useRef(authenticated);
+  const messagesLengthRef = useRef(messages.length);
 
-        if (!res.ok) {
-          const detail = data?.detail;
-          throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
-        }
+  useEffect(() => { selectedNodeRef.current = selectedNode; }, [selectedNode]);
+  useEffect(() => { selectedModelRef.current = selectedModel; }, [selectedModel]);
+  useEffect(() => { authenticatedRef.current = authenticated; }, [authenticated]);
+  useEffect(() => { messagesLengthRef.current = messages.length; }, [messages]);
 
-        const nodes = Array.isArray(data.nodes) ? data.nodes : [];
-        setAvailableNodes(nodes);
-        setNodeError("");
+  // Stable node-fetcher — only depends on API_BASE (constant), reads node
+  // selection via refs so the interval never needs to be restarted.
+  const fetchNodes = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/nodes`);
+      const raw = await res.text();
+      const data = parseJsonResponse(raw, res.status);
 
-        if (nodes.length === 0) {
-          setSelectedNode("");
-          setSelectedModel("");
-          return;
-        }
+      if (!res.ok) {
+        const detail = data?.detail;
+        throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
+      }
 
-        const selected = nodes.find((node) => node.node_id === selectedNode);
-        if (selected?.models?.includes(selectedModel)) {
-          return;
-        }
+      const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+      setAvailableNodes(nodes);
+      setNodeError("");
 
-        const nextNode = selected?.models?.length ? selected : findFirstNodeWithModel(nodes);
-        setSelectedNode(nextNode?.node_id || "");
-        setSelectedModel(nextNode?.models?.[0] || "");
-      } catch (err) {
-        console.error("Failed to fetch nodes", err);
-        setAvailableNodes([]);
+      if (nodes.length === 0) {
         setSelectedNode("");
         setSelectedModel("");
-        setNodeError(
-          err.message.includes("<!doctype") || err.message.includes("<html")
-            ? "Backend API is not connected. Set VITE_API_URL to your FastAPI URL."
-            : `Node lookup failed: ${err.message}`,
-        );
+        return;
       }
-    };
+
+      const curNode = selectedNodeRef.current;
+      const curModel = selectedModelRef.current;
+      const selected = nodes.find((node) => node.node_id === curNode);
+      if (selected?.models?.includes(curModel)) return;
+
+      const nextNode = selected?.models?.length ? selected : findFirstNodeWithModel(nodes);
+      setSelectedNode(nextNode?.node_id || "");
+      setSelectedModel(nextNode?.models?.[0] || "");
+    } catch (err) {
+      console.error("Failed to fetch nodes", err);
+      setAvailableNodes([]);
+      setSelectedNode("");
+      setSelectedModel("");
+      setNodeError(
+        err.message.includes("<!doctype") || err.message.includes("<html")
+          ? "Backend API is not connected. Set VITE_API_URL to your FastAPI URL."
+          : `Node lookup failed: ${err.message}`,
+      );
+    }
+  }, []); // stable — reads node state via refs
+
+  useEffect(() => {
     fetchNodes();
     const intervalId = setInterval(fetchNodes, 10000);
     return () => clearInterval(intervalId);
-  }, [selectedNode, selectedModel]);
+  }, [fetchNodes]);
 
-  const appendToLastAssistant = (content) => {
+  const appendToLastAssistant = useCallback((content) => {
     setMessages((prev) => {
       const newMsgs = [...prev];
       const lastIdx = newMsgs.length - 1;
@@ -159,9 +224,9 @@ export default function TerminalUI() {
       };
       return newMsgs;
     });
-  };
+  }, []);
 
-  const handleStreamEvent = (eventText) => {
+  const handleStreamEvent = useCallback((eventText) => {
     const normalized = eventText.replace(/\r\n/g, "\n").trim();
     const dataStr = normalized
       .replace(/\r\n/g, "\n")
@@ -170,10 +235,7 @@ export default function TerminalUI() {
       .map((line) => line.slice(5).trimStart())
       .join("\n");
 
-    if (!normalized || normalized.startsWith(":")) {
-      return;
-    }
-
+    if (!normalized || normalized.startsWith(":")) return;
     if (!dataStr) {
       console.warn("Ignoring non-SSE stream event", normalized);
       return;
@@ -189,7 +251,9 @@ export default function TerminalUI() {
     } catch {
       console.warn("Ignoring malformed stream event", dataStr);
     }
-  };
+  }, [appendToLastAssistant]);
+
+  // Auth / access check — remove `messages` from deps; use ref for the guard.
   useEffect(() => {
     if (authenticated && wallets && wallets.length > 0 && !hasCheckedAccess) {
       const walletAddress = wallets[0]?.address;
@@ -203,13 +267,9 @@ export default function TerminalUI() {
             address: CONTRACT_ADDRESS,
             abi: [
               {
-                inputs: [
-                  { internalType: "address", name: "", type: "address" },
-                ],
+                inputs: [{ internalType: "address", name: "", type: "address" }],
                 name: "expiryTimestamp",
-                outputs: [
-                  { internalType: "uint256", name: "", type: "uint256" },
-                ],
+                outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
                 stateMutability: "view",
                 type: "function",
               },
@@ -237,10 +297,7 @@ export default function TerminalUI() {
                 setMessages((prev) => [
                   ...prev,
                   { role: "system", content: "SESSION RESTORED." },
-                  ...loadedHistory.map((m) => ({
-                    role: m.role,
-                    content: m.content,
-                  })),
+                  ...loadedHistory.map((m) => ({ role: m.role, content: m.content })),
                 ]);
               }
             } catch (e) {
@@ -265,10 +322,7 @@ export default function TerminalUI() {
           setSessionState("locked");
           setMessages((prev) => [
             ...prev,
-            {
-              role: "system",
-              content: "AUTHENTICATED. AWAITING ACCESS PAYMENT.",
-            },
+            { role: "system", content: "AUTHENTICATED. AWAITING ACCESS PAYMENT." },
           ]);
         }
       };
@@ -276,27 +330,27 @@ export default function TerminalUI() {
       verifyAccess();
     }
 
-    // Reset state if disconnected
     if (!authenticated) {
       setHasCheckedAccess(false);
       setExpiryTime(0);
       setSessionState("locked");
-      if (
-        messages.length > 1 &&
-        !messages[messages.length - 1].content.includes("DISCONNECTED")
-      ) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "system",
-            content: "NODE DISCONNECTED. WAITING FOR PAYMENT...",
-          },
-        ]);
-      }
+      // Use ref to avoid reading `messages` state directly in this effect
+      setMessages((prev) => {
+        if (
+          prev.length > 1 &&
+          !prev[prev.length - 1].content.includes("DISCONNECTED")
+        ) {
+          return [
+            ...prev,
+            { role: "system", content: "NODE DISCONNECTED. WAITING FOR PAYMENT..." },
+          ];
+        }
+        return prev;
+      });
     }
-  }, [authenticated, wallets, hasCheckedAccess, messages]);
+  }, [authenticated, wallets, hasCheckedAccess]); // `messages` removed — handled via functional updater
 
-  // Countdown clock effect
+  // Countdown clock
   useEffect(() => {
     if (sessionState === "locked" || expiryTime === 0) {
       setTimeLeft(0);
@@ -307,15 +361,11 @@ export default function TerminalUI() {
       const remaining = expiryTime - now;
       if (remaining <= 0) {
         setTimeLeft(0);
-        // Important: check if not already locked so we only append message once
         setSessionState((prev) => {
           if (prev !== "locked") {
             setMessages((m) => [
               ...m,
-              {
-                role: "system",
-                content: "SESSION EXPIRED. AWAITING PAYMENT TO CONTINUE.",
-              },
+              { role: "system", content: "SESSION EXPIRED. AWAITING PAYMENT TO CONTINUE." },
             ]);
             return "locked";
           }
@@ -329,29 +379,26 @@ export default function TerminalUI() {
     return () => clearInterval(interval);
   }, [sessionState, expiryTime]);
 
-  const scrollToBottom = useCallback(() => {
+  // Auto-scroll: only scroll when messages change, guarded by autoScroll flag
+  useEffect(() => {
     if (autoScroll) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [autoScroll]);
+  }, [messages, autoScroll]);
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, scrollToBottom]);
-
-  const handleScroll = (e) => {
+  const handleScroll = useCallback((e) => {
     const { scrollTop, scrollHeight, clientHeight } = e.target;
     const atBottom = scrollHeight - scrollTop - clientHeight < 50;
     setAutoScroll(atBottom);
-  };
+  }, []);
 
-  const handlePay = async () => {
+  const handlePay = useCallback(async () => {
     if (!wallets || wallets.length === 0) return;
     try {
       const wallet = wallets[0];
       const provider = await wallet.getEthereumProvider();
 
-      const targetChainIdHex = "0x13fb"; // 5115
+      const targetChainIdHex = "0x13fb";
       try {
         await provider.request({
           method: "wallet_switchEthereumChain",
@@ -395,11 +442,10 @@ export default function TerminalUI() {
           content: `TRANSACTION SUBMITTED: ${hash}\nWAITING FOR BLOCK CONFIRMATION... (DO NOT REFRESH)`,
         },
       ]);
-      setSessionState("inference"); // Use inference state to temporarily disable input
+      setSessionState("inference");
 
       await accessReadClient.waitForTransactionReceipt({ hash });
 
-      // Fetch the real, newly updated expiry timestamp from the blockchain
       const newExpiry = await accessReadClient.readContract({
         address: CONTRACT_ADDRESS,
         abi: [{ inputs: [{ internalType: "address", name: "", type: "address" }], name: "expiryTimestamp", outputs: [{ internalType: "uint256", name: "", type: "uint256" }], stateMutability: "view", type: "function" }],
@@ -411,10 +457,7 @@ export default function TerminalUI() {
       setSessionState("active");
       setMessages((prev) => [
         ...prev,
-        {
-          role: "system",
-          content: `PAYMENT CONFIRMED.\nACCESS GRANTED. SESSION ACTIVE.`,
-        },
+        { role: "system", content: `PAYMENT CONFIRMED.\nACCESS GRANTED. SESSION ACTIVE.` },
       ]);
     } catch (err) {
       console.error(err);
@@ -423,9 +466,9 @@ export default function TerminalUI() {
         { role: "system", content: `PAYMENT FAILED: ${err.message}` },
       ]);
     }
-  };
+  }, [wallets]);
 
-  const handleSend = async (e) => {
+  const handleSend = useCallback(async (e) => {
     e.preventDefault();
     if (!input.trim() || sessionState === "locked") return;
 
@@ -433,11 +476,7 @@ export default function TerminalUI() {
     if (!userWallet) {
       setMessages((prev) => [
         ...prev,
-        {
-          role: "system",
-          content:
-            "[ERROR: WALLET DISCONNECTED OR NOT FOUND. PLEASE RECONNECT.]",
-        },
+        { role: "system", content: "[ERROR: WALLET DISCONNECTED OR NOT FOUND. PLEASE RECONNECT.]" },
       ]);
       setSessionState("locked");
       return;
@@ -451,34 +490,34 @@ export default function TerminalUI() {
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
+      // Read node selection from refs to avoid stale closure without re-creating handler
+      const curNode = selectedNodeRef.current;
+      const curModel = selectedModelRef.current;
       const firstNode = findFirstNodeWithModel(availableNodes);
-      const requestNode = selectedNode || firstNode?.node_id || "local_fallback";
-      const requestModel = selectedModel || firstNode?.models?.[0] || "";
+      const requestNode = curNode || firstNode?.node_id || "local_fallback";
+      const requestModel = curModel || firstNode?.models?.[0] || "";
+
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          wallet_address: userWallet, 
+        body: JSON.stringify({
+          wallet_address: userWallet,
           prompt,
           target_node: requestNode,
-          target_model: requestModel
+          target_model: requestModel,
         }),
       });
 
       if (!res.ok) {
         const raw = await res.text();
         let body = {};
-        try {
-          body = raw ? JSON.parse(raw) : {};
-        } catch {
+        try { body = raw ? JSON.parse(raw) : {}; } catch {
           throw new Error(raw.slice(0, 120) || `Server returned status ${res.status}`);
         }
         throw new Error(body?.detail || `Server returned status ${res.status}`);
       }
 
-      if (!res.body) {
-        throw new Error("Server did not return a response stream");
-      }
+      if (!res.body) throw new Error("Server did not return a response stream");
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -490,35 +529,72 @@ export default function TerminalUI() {
           buffer += decoder.decode();
           break;
         }
-
         buffer += decoder.decode(value, { stream: true });
         const events = buffer.split(/\n\n|\r\n\r\n/);
         buffer = events.pop() || "";
-
-        for (const eventText of events) {
-          handleStreamEvent(eventText);
-        }
+        for (const eventText of events) handleStreamEvent(eventText);
       }
 
-      if (buffer.trim()) {
-        handleStreamEvent(buffer);
-      }
+      if (buffer.trim()) handleStreamEvent(buffer);
     } catch (err) {
       appendToLastAssistant(formatStreamError(`CONNECTION ERROR: ${err.message}`));
     } finally {
-      // Restore appropriate state depending on whether expired during generation
       setSessionState((prev) => (prev === "locked" ? "locked" : "active"));
       setAutoScroll(true);
     }
-  };
+  }, [input, sessionState, wallets, availableNodes, handleStreamEvent, appendToLastAssistant]);
 
-  const formatTime = (secs) => {
-    const m = Math.floor(secs / 60)
-      .toString()
-      .padStart(2, "0");
+  const formatTime = useCallback((secs) => {
+    const m = Math.floor(secs / 60).toString().padStart(2, "0");
     const s = (secs % 60).toString().padStart(2, "0");
     return `${m}:${s}`;
-  };
+  }, []);
+
+  const lastMsgIdx = messages.length - 1;
+
+  // Memoize the node dropdown options so they don't recreate every render
+  const nodeOptions = useMemo(() => (
+    availableNodes.length === 0
+      ? <option value="" className="bg-black text-terminal-green">No Node Available</option>
+      : availableNodes.map(node =>
+          node.models?.length > 0
+            ? node.models.map(model => (
+                <option key={`${node.node_id}-${model}`} value={`${node.node_id}|${model}`} className="bg-black text-terminal-green">
+                  {node.node_id.substring(0, 6)} - {model}
+                </option>
+              ))
+            : null
+        )
+  ), [availableNodes]);
+
+  const handleNodeChange = useCallback((e) => {
+    const [nId, mod] = e.target.value.split("|");
+    setSelectedNode(nId);
+    setSelectedModel(mod);
+  }, []);
+
+  const handleLoadHistory = useCallback(async () => {
+    const addr = wallets?.[0]?.address;
+    if (!addr) return;
+    try {
+      const loadedHistory = await fetchChatHistory(addr);
+      if (loadedHistory.length > 0) {
+        setMessages((prev) => [
+          ...prev,
+          { role: "system", content: "SESSION RESTORED." },
+          ...loadedHistory.map((m) => ({ role: m.role, content: m.content })),
+        ]);
+      } else {
+        setMessages((prev) => [...prev, { role: "system", content: "NO PREVIOUS SESSION FOUND." }]);
+      }
+    } catch (e) {
+      console.error("Failed to load history", e);
+      setMessages((prev) => [...prev, { role: "system", content: "[ERROR: FAILED TO LOAD HISTORY]" }]);
+    }
+  }, [wallets]);
+
+  const nodeSelectValue = selectedNode && selectedModel ? `${selectedNode}|${selectedModel}` : "";
+  const textareaRows = Math.min(5, Math.max(1, input.split("\n").length));
 
   return (
     <div className="flex h-[100%] font-mono text-terminal-green gap-4">
@@ -527,37 +603,19 @@ export default function TerminalUI() {
         <div className="flex items-center justify-between pb-2 border-b border-terminal-green mb-4 opacity-80 text-sm tracking-widest font-bold">
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-2 uppercase"><Terminal size={18} /> THE BIT-BRAIN</span>
-            
-            {/* Model Selection Dropdown */}
+
             {sessionState !== "locked" && (
               <div className="flex flex-col ml-4">
-                <select 
+                <select
                   className="bg-transparent border border-terminal-green/50 text-terminal-green py-1 px-2 text-xs outline-none focus:border-terminal-green cursor-pointer disabled:opacity-50"
-                  value={selectedNode && selectedModel ? `${selectedNode}|${selectedModel}` : ""}
-                  onChange={(e) => {
-                    const [nId, mod] = e.target.value.split("|");
-                    setSelectedNode(nId);
-                    setSelectedModel(mod);
-                  }}
+                  value={nodeSelectValue}
+                  onChange={handleNodeChange}
                   disabled={sessionState === "inference" || availableNodes.length === 0}
                 >
-                  {availableNodes.length === 0 ? (
-                    <option value="" className="bg-black text-terminal-green">No Node Available</option>
-                  ) : (
-                    availableNodes.map(node => (
-                      node.models?.length > 0 ? (
-                        node.models.map(model => (
-                          <option key={`${node.node_id}-${model}`} value={`${node.node_id}|${model}`} className="bg-black text-terminal-green">
-                            {node.node_id.substring(0, 6)} - {model}
-                          </option>
-                        ))
-                      ) : null
-                    ))
-                  )}
+                  {nodeOptions}
                 </select>
               </div>
             )}
-            
           </div>
           <div className="uppercase">
             {sessionState === "locked" ? (
@@ -581,7 +639,7 @@ export default function TerminalUI() {
             <button
               onClick={() => {
                 setAutoScroll(true);
-                scrollToBottom();
+                messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
               }}
               className="sticky bottom-2 left-2 px-3 py-1 bg-terminal-green/20 border border-terminal-green/50 rounded text-xs hover:bg-terminal-green/30"
             >
@@ -589,100 +647,12 @@ export default function TerminalUI() {
             </button>
           )}
           {messages.map((msg, idx) => (
-            <div
+            <MessageRow
               key={idx}
-              className={
-                msg.role === "user"
-                  ? "text-blue-400"
-                  : msg.role === "system"
-                    ? "text-yellow-500/80 text-xs uppercase"
-                    : "text-terminal-green"
-              }
-            >
-              <span className="opacity-50 mr-2">
-                {msg.role === "user"
-                  ? ">"
-                  : msg.role === "system"
-                    ? "!"
-                    : "AI:"}
-              </span>
-              {msg.role === "assistant" && msg.content ? (
-                <div className="markdown-content prose prose-invert max-w-none">
-                  <ReactMarkdown
-                    components={{
-                      p: ({ children }) => <p className="mb-2">{children}</p>,
-                      ul: ({ children }) => (
-                        <ul className="list-disc ml-4 mb-2">{children}</ul>
-                      ),
-                      ol: ({ children }) => (
-                        <ol className="list-decimal ml-4 mb-2">{children}</ol>
-                      ),
-                      li: ({ children }) => (
-                        <li className="mb-1">{children}</li>
-                      ),
-                      h1: ({ children }) => (
-                        <h1 className="text-lg font-bold mb-2">{children}</h1>
-                      ),
-                      h2: ({ children }) => (
-                        <h2 className="text-base font-bold mb-2">{children}</h2>
-                      ),
-                      h3: ({ children }) => (
-                        <h3 className="text-sm font-bold mb-2">{children}</h3>
-                      ),
-                      code: ({ className, children, ...props }) => {
-                        const isInline = !className;
-                        return isInline ? (
-                          <code
-                            className="bg-terminal-green/20 px-1 rounded"
-                            {...props}
-                          >
-                            {children}
-                          </code>
-                        ) : (
-                          <code
-                            className="block bg-terminal-green/20 p-2 rounded my-2 overflow-x-auto whitespace-pre"
-                            {...props}
-                          >
-                            {children}
-                          </code>
-                        );
-                      },
-                      pre: ({ children }) => (
-                        <pre className="bg-terminal-green/10 p-2 rounded overflow-x-auto mb-2">
-                          {children}
-                        </pre>
-                      ),
-                      blockquote: ({ children }) => (
-                        <blockquote className="border-l-2 border-terminal-green/50 pl-2 italic">
-                          {children}
-                        </blockquote>
-                      ),
-                      a: ({ href, children }) => (
-                        <a
-                          href={href}
-                          className="underline hover:text-terminal-green/70"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          {children}
-                        </a>
-                      ),
-                    }}
-                  >
-                    {msg.content}
-                  </ReactMarkdown>
-                </div>
-              ) : (
-                <span className="whitespace-pre-wrap leading-relaxed">
-                  {msg.content}
-                </span>
-              )}
-              {msg.role === "assistant" &&
-                idx === messages.length - 1 &&
-                sessionState === "inference" && (
-                  <span className="cursor-blink"></span>
-                )}
-            </div>
+              msg={msg}
+              isLastAssistant={idx === lastMsgIdx}
+              isInference={sessionState === "inference"}
+            />
           ))}
           <div ref={messagesEndRef} />
         </div>
@@ -706,42 +676,9 @@ export default function TerminalUI() {
                   >
                     <Unlock size={16} /> PAY 0.0001 ETH TO UNLOCK
                   </button>
-                  {wallets && wallets[0]?.address && (
+                  {wallets?.[0]?.address && (
                     <button
-                      onClick={async () => {
-                        try {
-                          const loadedHistory = await fetchChatHistory(
-                            wallets[0].address,
-                          );
-                          if (loadedHistory.length > 0) {
-                            setMessages((prev) => [
-                              ...prev,
-                              { role: "system", content: "SESSION RESTORED." },
-                              ...loadedHistory.map((m) => ({
-                                role: m.role,
-                                content: m.content,
-                              })),
-                            ]);
-                          } else {
-                            setMessages((prev) => [
-                              ...prev,
-                              {
-                                role: "system",
-                                content: "NO PREVIOUS SESSION FOUND.",
-                              },
-                            ]);
-                          }
-                        } catch (e) {
-                          console.error("Failed to load history", e);
-                          setMessages((prev) => [
-                            ...prev,
-                            {
-                              role: "system",
-                              content: "[ERROR: FAILED TO LOAD HISTORY]",
-                            },
-                          ]);
-                        }
-                      }}
+                      onClick={handleLoadHistory}
                       className="px-6 py-2 border border-terminal-green/30 text-terminal-green/70 hover:text-terminal-green hover:border-terminal-green/70 transition-colors flex items-center gap-2 font-bold justify-center text-sm"
                     >
                       LOAD PREVIOUS SESSION
@@ -752,15 +689,13 @@ export default function TerminalUI() {
             </div>
           ) : (
             <form onSubmit={handleSend} className="flex flex-1 gap-2">
-              <span className="opacity-50 flex items-start bg-transparent pt-2">
-                {">"}
-              </span>
+              <span className="opacity-50 flex items-start bg-transparent pt-2">{">"}</span>
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 disabled={sessionState === "inference"}
                 placeholder="Enter prompt... (Shift+Enter for new line)"
-                rows={Math.min(5, Math.max(1, input.split("\n").length))}
+                rows={textareaRows}
                 className="flex-1 bg-transparent border-none outline-none text-terminal-green placeholder-terminal-green/30 resize-none overflow-y-auto mt-1"
                 autoFocus
                 onKeyDown={(e) => {
