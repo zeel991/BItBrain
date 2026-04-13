@@ -674,7 +674,7 @@ export default function TerminalUI() {
                     onClick={handlePay}
                     className="px-6 py-2 border border-terminal-green bg-terminal-green/10 hover:bg-terminal-green hover:text-black transition-colors flex items-center gap-2 font-bold justify-center"
                   >
-                    <Unlock size={16} /> PAY 0.0001 ETH TO UNLOCK
+                    <Unlock size={16} /> PAY 0.0001 cBTC TO UNLOCK
                   </button>
                   {wallets?.[0]?.address && (
                     <button
