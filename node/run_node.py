@@ -50,9 +50,12 @@ async def process_chat_task(ws, task_payload):
                     }))
                     return
                 
+                buffer = ""
                 async for chunk in response.content.iter_any():
                     if chunk:
-                        lines = chunk.decode('utf-8').strip().split('\\n')
+                        buffer += chunk.decode("utf-8")
+                        lines = buffer.split("\n")
+                        buffer = lines.pop()
                         for line in lines:
                             if not line.strip(): continue
                             try:
@@ -67,7 +70,18 @@ async def process_chat_task(ws, task_payload):
                                     "done": done
                                 }))
                             except json.JSONDecodeError:
-                                pass # partial chunk handling
+                                print(f"[Ollama Warning] Skipped malformed stream line: {line[:120]}")
+                if buffer.strip():
+                    try:
+                        data = json.loads(buffer)
+                        await ws.send(json.dumps({
+                            "type": "chat_chunk",
+                            "request_id": request_id,
+                            "content": data.get("message", {}).get("content", ""),
+                            "done": data.get("done", True)
+                        }))
+                    except json.JSONDecodeError:
+                        print(f"[Ollama Warning] Skipped trailing stream fragment: {buffer[:120]}")
     except Exception as e:
         print(f"[Task Error] {e}")
         await ws.send(json.dumps({

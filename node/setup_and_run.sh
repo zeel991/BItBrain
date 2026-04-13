@@ -45,7 +45,7 @@ export WALLET_ADDRESS=$WALLET_ADDRESS
 export OLLAMA_MODEL=$OLLAMA_MODEL
 
 # If you host your backend externally, you'd change this URL.
-export BACKEND_WS_URL="ws://localhost:8000/ws/provider"
+export BACKEND_WS_URL="wss://bitbrain-api.onrender.com/ws/provider"
 
 # Run the python script. When we Ctrl-C, it will trap and close.
 python3 run_node.py

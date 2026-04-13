@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { usePrivy, useWallets } from "@privy-io/react-auth";
 import { HardwareWidget } from "./HardwareWidget";
 import { Send, Terminal, Lock, Unlock } from "lucide-react";
@@ -37,23 +37,35 @@ const API_BASE =
     ? "http://localhost:8000"
     : String(_viteApi).replace(/\/$/, "");
 
+function parseJsonResponse(raw, status) {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    throw new Error(raw.slice(0, 120) || `HTTP ${status}`);
+  }
+}
+
 async function fetchChatHistory(walletAddress) {
   const res = await fetch(
     `${API_BASE}/history/${encodeURIComponent(walletAddress)}`,
   );
   const raw = await res.text();
-  let body;
-  try {
-    body = raw ? JSON.parse(raw) : {};
-  } catch {
-    throw new Error(raw.slice(0, 120) || `HTTP ${res.status}`);
-  }
+  const body = parseJsonResponse(raw, res.status);
   if (!res.ok) {
     const detail = body?.detail;
     throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
   }
   return body.history || [];
 }
+
+function findFirstNodeWithModel(nodes) {
+  return nodes.find((node) => node.models?.length > 0) || nodes[0] || null;
+}
+
+function formatStreamError(message) {
+  return `\n[ERROR: ${message}]`;
+}
+
 // SESSION_PRICE is 0.0001 ether = 100000000000000 wei = 0x5af3107a4000
 const SESSION_PRICE_HEX = "0x5af3107a4000";
 
@@ -75,13 +87,13 @@ export default function TerminalUI() {
     },
   ]);
   const [input, setInput] = useState("");
-  const [txHash, setTxHash] = useState(null);
   const [autoScroll, setAutoScroll] = useState(true);
   
   // New state for Decentralized Node Selection
   const [availableNodes, setAvailableNodes] = useState([]);
   const [selectedNode, setSelectedNode] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
+  const [nodeError, setNodeError] = useState("");
   
   const chatContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -91,24 +103,85 @@ export default function TerminalUI() {
     const fetchNodes = async () => {
       try {
         const res = await fetch(`${API_BASE}/nodes`);
-        if (res.ok) {
-          const data = await res.json();
-          setAvailableNodes(data.nodes || []);
-          // Auto-select first available node if none selected
-          if (data.nodes && data.nodes.length > 0 && !selectedNode) {
-            setSelectedNode(data.nodes[0].node_id);
-            setSelectedModel(data.nodes[0].models[0] || "");
-          }
+        const raw = await res.text();
+        const data = parseJsonResponse(raw, res.status);
+
+        if (!res.ok) {
+          const detail = data?.detail;
+          throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
         }
+
+        const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+        setAvailableNodes(nodes);
+        setNodeError("");
+
+        if (nodes.length === 0) {
+          setSelectedNode("");
+          setSelectedModel("");
+          return;
+        }
+
+        const selected = nodes.find((node) => node.node_id === selectedNode);
+        if (selected?.models?.includes(selectedModel)) {
+          return;
+        }
+
+        const nextNode = selected?.models?.length ? selected : findFirstNodeWithModel(nodes);
+        setSelectedNode(nextNode?.node_id || "");
+        setSelectedModel(nextNode?.models?.[0] || "");
       } catch (err) {
         console.error("Failed to fetch nodes", err);
+        setAvailableNodes([]);
+        setSelectedNode("");
+        setSelectedModel("");
+        setNodeError(
+          err.message.includes("<!doctype") || err.message.includes("<html")
+            ? "Backend API is not connected. Set VITE_API_URL to your FastAPI URL."
+            : `Node lookup failed: ${err.message}`,
+        );
       }
     };
     fetchNodes();
     const intervalId = setInterval(fetchNodes, 10000);
     return () => clearInterval(intervalId);
-  }, [selectedNode]);
+  }, [selectedNode, selectedModel]);
 
+  const appendToLastAssistant = (content) => {
+    setMessages((prev) => {
+      const newMsgs = [...prev];
+      const lastIdx = newMsgs.length - 1;
+      if (lastIdx < 0 || newMsgs[lastIdx].role !== "assistant") {
+        return [...newMsgs, { role: "assistant", content }];
+      }
+      newMsgs[lastIdx] = {
+        ...newMsgs[lastIdx],
+        content: newMsgs[lastIdx].content + content,
+      };
+      return newMsgs;
+    });
+  };
+
+  const handleStreamEvent = (eventText) => {
+    const dataStr = eventText
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+
+    if (!dataStr) return;
+
+    try {
+      const data = JSON.parse(dataStr);
+      if (data.content !== undefined) {
+        appendToLastAssistant(data.content);
+      } else if (data.error) {
+        appendToLastAssistant(formatStreamError(data.error));
+      }
+    } catch {
+      appendToLastAssistant(formatStreamError("Malformed stream event"));
+    }
+  };
   useEffect(() => {
     if (authenticated && wallets && wallets.length > 0 && !hasCheckedAccess) {
       const walletAddress = wallets[0]?.address;
@@ -248,15 +321,15 @@ export default function TerminalUI() {
     return () => clearInterval(interval);
   }, [sessionState, expiryTime]);
 
-  const scrollToBottom = () => {
+  const scrollToBottom = useCallback(() => {
     if (autoScroll) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  };
+  }, [autoScroll]);
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, scrollToBottom]);
 
   const handleScroll = (e) => {
     const { scrollTop, scrollHeight, clientHeight } = e.target;
@@ -306,8 +379,7 @@ export default function TerminalUI() {
           },
         ],
       });
-      setTxHash(hash);
-      
+
       setMessages((prev) => [
         ...prev,
         {
@@ -371,75 +443,60 @@ export default function TerminalUI() {
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
+      const firstNode = findFirstNodeWithModel(availableNodes);
+      const requestNode = selectedNode || firstNode?.node_id || "local_fallback";
+      const requestModel = selectedModel || firstNode?.models?.[0] || "";
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
           wallet_address: userWallet, 
           prompt,
-          target_node: selectedNode || "local_fallback",
-          target_model: selectedModel || ""
+          target_node: requestNode,
+          target_model: requestModel
         }),
       });
 
       if (!res.ok) {
-        throw new Error(`Server returned status ${res.status}`);
+        const raw = await res.text();
+        let body = {};
+        try {
+          body = raw ? JSON.parse(raw) : {};
+        } catch {
+          throw new Error(raw.slice(0, 120) || `Server returned status ${res.status}`);
+        }
+        throw new Error(body?.detail || `Server returned status ${res.status}`);
+      }
+
+      if (!res.body) {
+        throw new Error("Server did not return a response stream");
       }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = "";
 
       while (true) {
         const { value, done } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
 
-        const chunkStr = decoder.decode(value);
-        const lines = chunkStr.split("\n\n");
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split(/\n\n|\r\n\r\n/);
+        buffer = events.pop() || "";
 
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const dataStr = line.replace("data: ", "");
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.content !== undefined) {
-                setMessages((prev) => {
-                  const newMsgs = [...prev];
-                  const lastIdx = newMsgs.length - 1;
-                  newMsgs[lastIdx] = {
-                    ...newMsgs[lastIdx],
-                    content: newMsgs[lastIdx].content + data.content,
-                  };
-                  return newMsgs;
-                });
-              } else if (data.error) {
-                setMessages((prev) => {
-                  const newMsgs = [...prev];
-                  const lastIdx = newMsgs.length - 1;
-                  newMsgs[lastIdx] = {
-                    ...newMsgs[lastIdx],
-                    content:
-                      newMsgs[lastIdx].content + `\n[ERROR: ${data.error}]`,
-                  };
-                  return newMsgs;
-                });
-              }
-            } catch (e) {
-              // Ignore incomplete JSON chunks from split issue
-            }
-          }
+        for (const eventText of events) {
+          handleStreamEvent(eventText);
         }
       }
+
+      if (buffer.trim()) {
+        handleStreamEvent(buffer);
+      }
     } catch (err) {
-      setMessages((prev) => {
-        const newMsgs = [...prev];
-        const lastIdx = newMsgs.length - 1;
-        newMsgs[lastIdx] = {
-          ...newMsgs[lastIdx],
-          content:
-            newMsgs[lastIdx].content + `[CONNECTION ERROR: ${err.message}]`,
-        };
-        return newMsgs;
-      });
+      appendToLastAssistant(formatStreamError(`CONNECTION ERROR: ${err.message}`));
     } finally {
       // Restore appropriate state depending on whether expired during generation
       setSessionState((prev) => (prev === "locked" ? "locked" : "active"));
@@ -480,7 +537,7 @@ export default function TerminalUI() {
                     <option value="" className="bg-black text-terminal-green">No Node Available</option>
                   ) : (
                     availableNodes.map(node => (
-                      node.models.length > 0 ? (
+                      node.models?.length > 0 ? (
                         node.models.map(model => (
                           <option key={`${node.node_id}-${model}`} value={`${node.node_id}|${model}`} className="bg-black text-terminal-green">
                             {node.node_id.substring(0, 6)} - {model}
@@ -719,7 +776,11 @@ export default function TerminalUI() {
 
       {/* Sidebar Column */}
       <div className="w-64 max-w-xs hidden md:flex flex-col gap-4 p-4 border-l border-terminal-green/20">
-        <HardwareWidget />
+        <HardwareWidget
+          nodes={availableNodes}
+          selectedNode={selectedNode}
+          nodeError={nodeError}
+        />
         {authenticated && (
           <button
             onClick={logout}
