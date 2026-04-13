@@ -477,6 +477,7 @@ const PixelBlast = ({
       uniforms.uColor.value.set(cur.color);
       uniforms.uScale.value           = cur.patternScale;
       uniforms.uDensity.value         = cur.patternDensity;
+      uniforms.uPixelSize.value       = cur.pixelSize * renderer.getPixelRatio();
       uniforms.uPixelJitter.value     = cur.pixelSizeJitter;
       uniforms.uEnableRipples.value   = cur.enableRipples ? 1 : 0;
       uniforms.uRippleIntensity.value = cur.rippleIntensityScale;
@@ -513,7 +514,7 @@ const PixelBlast = ({
     };
     raf = requestAnimationFrame(animate);
 
-    if (cur.transparent) renderer.setClearAlpha(0);
+    if (p.transparent) renderer.setClearAlpha(0);
     else renderer.setClearColor(0x000000, 1);
 
     threeRef.current = {
