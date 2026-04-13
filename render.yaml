@@ -1,0 +1,23 @@
+# Render Blueprint: connect this repo, then set secrets in the dashboard.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: bitbrain-api
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: OLLAMA_MODEL
+        value: llama3
+      - key: CONTRACT_ADDRESS
+        value: 0xc8e32DC7a3b60b67d45eC67b6716098785E2482C
+      # Required: Cloudflare tunnel to your laptop Ollama, full path /api/chat
+      - key: OLLAMA_URL
+        sync: false
+      # Optional: comma-separated frontend URLs; omit for default "*" (demo)

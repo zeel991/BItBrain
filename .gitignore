@@ -1,0 +1,19 @@
+# Demo / build output (regenerate: cd frontend && npm run demo:sync)
+backend/static/
+
+# Frontend build
+frontend/dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.ruff_cache/
+
+# Local env & data (optional: remove chat_history.db yourself to reset history)
+backend/.env
+frontend/.env
+backend/venv/
+node/venv/
+backend/chat_history.db
