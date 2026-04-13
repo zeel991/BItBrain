@@ -29,6 +29,8 @@ async def process_chat_task(ws, task_payload):
     request_id = task_payload.get("request_id")
     messages = task_payload.get("messages", [])
     model = task_payload.get("model", OLLAMA_MODEL)
+    chunk_count = 0
+    response_chars = 0
     
     print(f"\\n[Task] Processing task {request_id} for model {model}...")
     
@@ -42,10 +44,12 @@ async def process_chat_task(ws, task_payload):
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{OLLAMA_API_URL}/api/chat", json=req_data) as response:
                 if response.status != 200:
+                    error_body = await response.text()
+                    print(f"[Task Error] Ollama HTTP {response.status}: {error_body[:300]}")
                     await ws.send(json.dumps({
                         "type": "chat_chunk",
                         "request_id": request_id, 
-                        "error": f"Ollama HTTP {response.status}",
+                        "error": f"Ollama HTTP {response.status}: {error_body[:200]}",
                         "done": True
                     }))
                     return
@@ -62,6 +66,8 @@ async def process_chat_task(ws, task_payload):
                                 data = json.loads(line)
                                 content = data.get("message", {}).get("content", "")
                                 done = data.get("done", False)
+                                chunk_count += 1
+                                response_chars += len(content)
                                 
                                 await ws.send(json.dumps({
                                     "type": "chat_chunk",
@@ -69,19 +75,43 @@ async def process_chat_task(ws, task_payload):
                                     "content": content,
                                     "done": done
                                 }))
+                                if done:
+                                    print(
+                                        f"[Task] Completed task {request_id}: "
+                                        f"{chunk_count} chunks, {response_chars} chars"
+                                    )
+                                    return
                             except json.JSONDecodeError:
                                 print(f"[Ollama Warning] Skipped malformed stream line: {line[:120]}")
                 if buffer.strip():
                     try:
                         data = json.loads(buffer)
+                        content = data.get("message", {}).get("content", "")
+                        done = data.get("done", True)
+                        chunk_count += 1
+                        response_chars += len(content)
                         await ws.send(json.dumps({
                             "type": "chat_chunk",
                             "request_id": request_id,
-                            "content": data.get("message", {}).get("content", ""),
-                            "done": data.get("done", True)
+                            "content": content,
+                            "done": done
                         }))
+                        print(
+                            f"[Task] Completed task {request_id}: "
+                            f"{chunk_count} chunks, {response_chars} chars"
+                        )
                     except json.JSONDecodeError:
                         print(f"[Ollama Warning] Skipped trailing stream fragment: {buffer[:120]}")
+                else:
+                    await ws.send(json.dumps({
+                        "type": "chat_chunk",
+                        "request_id": request_id,
+                        "done": True
+                    }))
+                    print(
+                        f"[Task] Completed task {request_id}: "
+                        f"{chunk_count} chunks, {response_chars} chars"
+                    )
     except Exception as e:
         print(f"[Task Error] {e}")
         await ws.send(json.dumps({

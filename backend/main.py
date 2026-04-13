@@ -289,6 +289,11 @@ async def chat(request: ChatRequest):
     else:
         # Just pick the first available node (rudimentary load balancing)
         selected_node = list(manager.active_nodes.keys())[0]
+    print(
+        f"[DEBUG] Chat route: "
+        f"{'local_fallback' if use_local_fallback else selected_node} "
+        f"model={target_model or OLLAMA_MODEL}"
+    )
 
     # Save user prompt & manage user context
     add_message(checksum_addr, "user", request.prompt)
@@ -338,6 +343,7 @@ async def chat(request: ChatRequest):
             
             try:
                 await manager.send_task(selected_node, task_payload)
+                print(f"[DEBUG] Sent task {req_id} to node {selected_node}")
             except Exception as e:
                 yield f"data: {json.dumps({'error': f'Failed to send task to node {selected_node}'})}\\n\\n"
                 del manager.pending_tasks[req_id]
@@ -348,9 +354,12 @@ async def chat(request: ChatRequest):
                     # Implement local timeout to not hang forever if node dies
                     chunk_data = await asyncio.wait_for(q.get(), timeout=30.0)
                     if chunk_data is None:
+                        print(f"[DEBUG] Task {req_id} completed")
                         break # Done
                     if "error" in chunk_data:
-                        yield f"data: {json.dumps({'error': f'Node Error: {chunk_data['error']}'})}\\n\\n"
+                        error = chunk_data["error"]
+                        print(f"[DEBUG] Task {req_id} node error: {error}")
+                        yield f"data: {json.dumps({'error': f'Node Error: {error}'})}\\n\\n"
                         break
                     
                     content = chunk_data.get("content", "")

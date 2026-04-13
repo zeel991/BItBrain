@@ -162,14 +162,18 @@ export default function TerminalUI() {
   };
 
   const handleStreamEvent = (eventText) => {
-    const dataStr = eventText
+    const normalized = eventText.replace(/\r\n/g, "\n").trim();
+    const dataStr = normalized
       .replace(/\r\n/g, "\n")
       .split("\n")
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trimStart())
       .join("\n");
 
-    if (!dataStr) return;
+    if (!dataStr) {
+      console.warn("Ignoring non-SSE stream event", normalized);
+      return;
+    }
 
     try {
       const data = JSON.parse(dataStr);
@@ -179,7 +183,7 @@ export default function TerminalUI() {
         appendToLastAssistant(formatStreamError(data.error));
       }
     } catch {
-      appendToLastAssistant(formatStreamError("Malformed stream event"));
+      console.warn("Ignoring malformed stream event", dataStr);
     }
   };
   useEffect(() => {
