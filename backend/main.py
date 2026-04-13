@@ -220,7 +220,15 @@ async def websocket_provider(websocket: WebSocket, wallet_address: str):
                 
                 if req_id in manager.pending_tasks:
                     q = manager.pending_tasks[req_id]
+                    if content:
+                        print(
+                            f"[DEBUG] Received chunk for task {req_id}: "
+                            f"{len(content)} chars"
+                        )
+                    if done:
+                        print(f"[DEBUG] Received done for task {req_id}")
                     if error:
+                        print(f"[DEBUG] Received error for task {req_id}: {error}")
                         await q.put({"error": error})
                         await q.put(None) # Signal end
                     else:
@@ -228,6 +236,11 @@ async def websocket_provider(websocket: WebSocket, wallet_address: str):
                             await q.put({"content": content})
                         if done:
                             await q.put(None) # Signal end
+                else:
+                    print(
+                        f"[DEBUG] Dropped chunk for unknown task {req_id}: "
+                        f"content={len(content)} done={done} error={bool(error)}"
+                    )
                             
     except WebSocketDisconnect:
         print(f"[DEBUG] Node {node_id} disconnected")
@@ -303,6 +316,7 @@ async def chat(request: ChatRequest):
     # Async generator for SSE
     async def stream_generator():
         full_response = ""
+        streamed_chunks = 0
         
         if use_local_fallback:
             # ORIGINAL LOCAL BEHAVIOR
@@ -333,6 +347,7 @@ async def chat(request: ChatRequest):
             req_id = str(uuid.uuid4())
             q = asyncio.Queue()
             manager.pending_tasks[req_id] = q
+            yield f"data: {json.dumps({'status': 'queued', 'request_id': req_id})}\\n\\n"
             
             task_payload = {
                 "type": "chat_task",
@@ -364,17 +379,36 @@ async def chat(request: ChatRequest):
                     
                     content = chunk_data.get("content", "")
                     full_response += content
+                    streamed_chunks += 1
                     yield f"data: {json.dumps({'content': content})}\\n\\n"
             except asyncio.TimeoutError:
                 yield f"data: {json.dumps({'error': f'Node {selected_node} timed out'})}\\n\\n"
+            except asyncio.CancelledError:
+                print(
+                    f"[DEBUG] Client disconnected during task {req_id}: "
+                    f"{streamed_chunks} chunks, {len(full_response)} chars"
+                )
+                raise
             finally:
                 if req_id in manager.pending_tasks:
                     del manager.pending_tasks[req_id]
 
         if full_response:
             add_message(checksum_addr, "assistant", full_response)
+        print(
+            f"[DEBUG] Stream finished: {streamed_chunks} chunks, "
+            f"{len(full_response)} chars"
+        )
 
-    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/history/{address}")
