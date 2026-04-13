@@ -234,7 +234,7 @@ async def chat(request: ChatRequest):
             if isinstance(e, HTTPException):
                 raise e
             print(f"Contract check error: {e}")
-            raise HTTPException(status_code=500, detail="Blockchain validation failed")
+            raise HTTPException(status_code=500, detail=f"Blockchain validation failed: {str(e)}")
 
     # If no target node specified, we can try to find one or fallback to local
     use_local_fallback = False

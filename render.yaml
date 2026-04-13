@@ -16,7 +16,7 @@ services:
       - key: OLLAMA_MODEL
         value: llama3
       - key: CONTRACT_ADDRESS
-        value: 0xc8e32DC7a3b60b67d45eC67b6716098785E2482C
+        value: 0xC8014e9D37cc59Fed1988aCbfFE59246A16374AA
       # Required: Cloudflare tunnel to your laptop Ollama, full path /api/chat
       - key: OLLAMA_URL
         sync: false
